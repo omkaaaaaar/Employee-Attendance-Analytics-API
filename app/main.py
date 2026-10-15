@@ -16,7 +16,7 @@ from typing import Optional, Literal, Annotated
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError, PyMongoError    #DuplicateKeyError will handle uniqueness conflicts safely.
 
@@ -37,6 +37,50 @@ app = FastAPI(
     title="Employee Attendance & Analytics API",
     version="2.0.0",
 )
+
+@app.on_event("startup")
+def create_indexes():
+    db.employees.create_index(
+        [("emp_code", ASCENDING)],
+        unique=True,
+        name="uq_employee_emp_code",
+    )
+
+    db.employees.create_index(
+        [("department", ASCENDING), ("emp_code", ASCENDING)],
+        name="ix_employee_department_code",
+    )
+
+    db.employees.create_index(
+        [("joined_on", ASCENDING), ("department", ASCENDING)],
+        name="ix_employee_joined_department",
+    )
+
+    db.attendance_logs.create_index(
+        [("emp_code", ASCENDING), ("date", ASCENDING)],
+        unique=True,
+        name="uq_attendance_employee_date",
+    )
+
+    db.attendance_logs.create_index(
+        [("date", DESCENDING), ("emp_code", ASCENDING)],
+        name="ix_attendance_date_employee",
+    )
+
+    db.attendance_logs.create_index(
+        [
+            ("emp_code", ASCENDING),
+            ("date", ASCENDING),
+            ("status", ASCENDING),
+        ],
+        name="ix_attendance_employee_date_status",
+    )
+
+    db.attendance_logs.create_index(
+        [("emp_code", ASCENDING), ("punch_in", DESCENDING)],
+        name="ix_attendance_open_punch",
+    )
+
 
 PRESENCE_STATUSES = ("PRESENT", "WFH", "ON_DUTY")
 ALL_STATUSES = (*PRESENCE_STATUSES, "ABSENT", "LEAVE")
@@ -228,6 +272,24 @@ def compute_derived_fields(
 
 
 
+def serialize_document(doc: dict) -> dict:
+    def convert(value):
+        if isinstance(value, datetime):
+            return datetime_to_epoch_ms(value)
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: convert(item)
+                for key, item in value.items()
+                if key != "_id"
+            }
+        return value
+
+    return convert({k: v for k, v in doc.items() if k != "_id"})
+
+
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
@@ -239,13 +301,13 @@ EpochMillis = Annotated[
 
 
 class EmployeeIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")    #Pydantic to ignore fields that aren't defined in the model.
 
-    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")    #^EMP: must start with EMP, \d{4, 6}: must contain 4 to 6 digits, $: must end there
     name: str = Field(min_length=1, max_length=100)
     email: str = Field(
         max_length=120,
-        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",    #Some characters before @, An @ symbol, A domain containing a dot, No spaces
     )
     department: str = Field(min_length=1, max_length=50)
     shift_start: str = Field(
@@ -294,38 +356,78 @@ class RegularizeIn(BaseModel):
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    try:
+        db.command("ping")
+        return {"status": "ok"}
+    except PyMongoError:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable",
+        )
+
+
 
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
+    doc = body.model_dump(mode="json")
+    doc["created_at"] = datetime.now(UTC)
+
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
         raise HTTPException(409, "emp_code already exists")
-    doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+
+    return serialize_document(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
-    q = {}
-    if department:
-        q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    query = {}
+    if department is not None:
+        query["department"] = department
+
+    total = db.employees.count_documents(query)
+
+    cursor = (
+        db.employees.find(query, {"_id": 0})
+        .sort("emp_code", ASCENDING)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+
+    return {
+        "items": [serialize_document(doc) for doc in cursor],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
 
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+
+    try:
+        ts = (
+            epoch_ms_to_datetime(body.punched_at)
+            if body.punched_at is not None
+            else datetime.now(UTC)
+        )
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(422, "invalid punched_at timestamp")
+
+    d = attendance_date_for(ts, emp["shift_start"], emp["shift_end"])
     if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
         raise HTTPException(409, "already punched in for this date")
     doc = {
@@ -335,15 +437,17 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"], d),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+
+    return serialize_document(doc)
 
 
 @app.get("/attendance")
@@ -352,8 +456,8 @@ def list_attendance(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
     q = {}
     if emp_code:
@@ -366,12 +470,15 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
+
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q, {"_id": 0})
+        .sort("date", DESCENDING)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    page_docs = [serialize_document(d) for d in cursor]
     return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
 
 
